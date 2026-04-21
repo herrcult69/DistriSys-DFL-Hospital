@@ -3,6 +3,10 @@ package hospital.dfl;
 import java.util.ArrayList;
 import java.util.List;
 
+import java.io.DataOutputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+
 public class RoundController {
     private final NodeParam params;
     private final ClientNode client;
@@ -10,6 +14,28 @@ public class RoundController {
     private final String peerHost;
     private final int totalRounds;
     private final int minPeers; // minimum peers needed to do Federated Learning Calculation
+
+    private static final byte MSG_AGGREGATED_PARAMS = 2;
+    private static final byte VERSION = 1;
+    private static final byte[] MAGIC = new byte[]{'D', 'F', 'L', '1'};
+
+    private void sendParamsToPython(DataOutputStream out, int round, double[] weights, double bias) throws Exception{
+        ByteBuffer payload = ByteBuffer.allocate(4 + (weights.length * 4) + 4).order(ByteOrder.LITTLE_ENDIAN);
+        payload.putInt(weights.length);
+        for (double w : weights){
+            payload.putFloat((float) w);
+        }
+        payload.putFloat((float) bias);
+
+        byte[] p = payload.array();
+        out.write(MAGIC);
+        out.writeByte(VERSION);
+        out.writeByte(MSG_AGGREGATED_PARAMS);
+        out.writeInt(round);
+        out.writeInt(p.length);
+        out.write(p);
+        out.flush();
+    }
 
     public RoundController(NodeParam params, int[] peerPorts, int totalRounds) {
         this.params = params;
