@@ -9,7 +9,7 @@ package hospital.dfl;
 public class MainNode {
 
     private static final int NUM_FEATURES  = 4;  // placeholder
-    private static final int TOTAL_ROUNDS  = 5;
+    private static final int TOTAL_ROUNDS  = 1;
 
     public static void main(String[] args) throws InterruptedException {
         if (args.length < 2) {

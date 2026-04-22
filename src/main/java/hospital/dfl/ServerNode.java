@@ -30,7 +30,7 @@ public class ServerNode implements Runnable {
     public void run() {
         try {
             serverSocket = new ServerSocket(port);
-            System.out.println("Node " + params.getNodeId() + ": Server listening on port " + port);
+            System.out.println("Node " + params.getNodeId() + ": Java Server listening on port " + port);
             while (running) {
                 try {
                     Socket client = serverSocket.accept();
