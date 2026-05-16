@@ -28,7 +28,7 @@ public class RoundController {
 
     private static final String PY_HOST = "127.0.0.1";
     private static final int PY_BASE_PORT = 5000;
-    private static final int PY_TIMEOUT_MS = 120_000;
+    private static final int PY_TIMEOUT_MS = 1_000_000_000;
 
     public RoundController(NodeParam params, int[] peerPorts, int totalRounds) {
         this.params = params;
