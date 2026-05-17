@@ -1,195 +1,181 @@
 package hospital.dfl;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
-import java.net.Socket;
-import java.net.SocketTimeoutException;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
 
 public class RoundController {
-    private final NodeParam params;
-    private final ClientNode client;
-    private final int[] peerPorts;
-    private final String peerHost;
+
+    private final NodeParam nodeParam;
     private final int totalRounds;
-    private final int minPeers; // minimum peers needed to do Federated Learning Calculation
+    private final String pythonBase;
+    private static final long TRAIN_TIMEOUT_MS     = 60 * 60 * 1000;  // 60 min
+    private static final long AGGREGATE_TIMEOUT_MS = 15 * 60 * 1000;  // 15 min
 
-    private static final byte MSG_TRAIN_RESULT = 1;
-    private static final byte MSG_AGGREGATED_PARAMS = 2;
-    private static final byte MSG_SHUTDOWN = 3;
 
-    private static final byte VERSION = 1;
-    private static final byte[] MAGIC = new byte[]{'D', 'F', 'L', '1'};
+    // Weight-server addresses for all nodes on the LAN.
+    // FIX (Bug 2 / Issue 2): ports match fl_server.py formula: WEIGHT_PORT = 5200 + NODE_ID
+    // For a single-machine prototype all IPs are 127.0.0.1.
+    // For a real LAN deployment, replace IPs with each machine's LAN IP.
+    private static final Map<Integer, String> ALL_WEIGHT_ADDRS;
+    static {
+        ALL_WEIGHT_ADDRS = new HashMap<>();
+        ALL_WEIGHT_ADDRS.put(1, "127.0.0.1:5201");
+        ALL_WEIGHT_ADDRS.put(2, "127.0.0.1:5202");
+        ALL_WEIGHT_ADDRS.put(3, "127.0.0.1:5203");
+    }
 
-    private static final String PY_HOST = "127.0.0.1";
-    private static final int PY_BASE_PORT = 5000;
-    private static final int PY_TIMEOUT_MS = 1_000_000_000;
-
-    public RoundController(NodeParam params, int[] peerPorts, int totalRounds) {
-        this.params = params;
-        this.client = new ClientNode(params.getNodeId());
-        this.peerPorts = peerPorts;
-        this.peerHost = "localhost";
+    public RoundController(NodeParam nodeParam, int totalRounds) {
+        this.nodeParam   = nodeParam;
         this.totalRounds = totalRounds;
-        this.minPeers = 1;
+        // FIX (Bug 2): IPC port = 5100 + nodeId, matching fl_server.py LOCAL_PORT formula
+        this.pythonBase  = "http://127.0.0.1:" + (5100 + nodeParam.getNodeId());
     }
 
-    public void runRounds() throws InterruptedException  {
-        int pyPort = PY_BASE_PORT + params.getNodeId();
-        try(
-            Socket pySocket = new Socket(PY_HOST, pyPort);
-            DataInputStream in = new DataInputStream(new BufferedInputStream(pySocket.getInputStream()));
-            DataOutputStream out = new DataOutputStream(new BufferedOutputStream(pySocket.getOutputStream()));
+    public void runRounds() throws Exception {
+        for (int round = 1; round <= totalRounds; round++) {
+            System.out.printf("=== Round %d / %d ===%n", round, totalRounds);
+            runRound(round);
+        }
+        System.out.println("Federated Learning complete!");
+    }
 
-        ){
-            pySocket.setSoTimeout(PY_TIMEOUT_MS);
-            System.out.println("Connected to Python at " + PY_HOST + ":"  + pyPort);
+    private void runRound(int round) throws Exception {
+        // Step 1 — Broadcast ROUND_START to peers only (not self)
+        broadcastTCP(String.format("{\"type\":\"ROUND_START\",\"round\":%d}", round));
 
-            for (int round = 1; round <= totalRounds; round++){
-                params.setCurrentRound(round);
-                System.out.println("\nNode " + params.getNodeId() + " : Round " + round);
+        // Step 2 — Trigger local Python training
+        System.out.println("[Java] Triggering local Python training...");
+        httpPost(pythonBase + "/train", String.format("{\"round\":%d}", round));
 
-                // 1) Java waits while Python trains
-                Frame trainResult = readFrame(in);
-                if (trainResult.type != MSG_TRAIN_RESULT){
-                    throw new IllegalStateException("Expected TRAIN_RESULT, got type=" + trainResult.type);
+        // Step 3 — Poll until training complete
+        pollUntilStatus("training_complete", TRAIN_TIMEOUT_MS);
+        System.out.println("[Java] Training complete.");
 
+        // Step 4 — Notify peers this node finished training
+        broadcastTCP(String.format("{\"type\":\"ROUND_COMPLETE\",\"node\":%d,\"round\":%d}",
+                nodeParam.getNodeId(), round));
+
+        // Step 5 — Wait for ROUND_COMPLETE from all peers
+        // FIX (Bug 1): self is pre-added to finishedNodes so we don't need to self-send
+        // and don't risk leaking stale ROUND_START messages into the barrier.
+        waitForAllPeers("ROUND_COMPLETE", round);
+        System.out.println("[Java] All nodes finished Round " + round + ". Starting aggregation.");
+
+        // Step 6 — Trigger local Python aggregation with PEER weight addresses (excluding self)
+        // FIX (Issue 2): buildPeersJson filters out self so Python never HTTP-downloads its own adapter
+        String peersJson = buildPeersJson(ALL_WEIGHT_ADDRS);
+        httpPost(pythonBase + "/aggregate",
+                String.format("{\"round\":%d,\"peers\":%s}", round, peersJson));
+
+        // Step 7 — Poll until aggregation complete
+        pollUntilStatus("aggregate_complete", AGGREGATE_TIMEOUT_MS);
+        System.out.printf("[Java] Node %d Round %d fully complete.%n", nodeParam.getNodeId(), round);
+    }
+
+    // ── FIX (Bug 1): Only broadcast to peers — never to self ─────────────────
+    private void broadcastTCP(String json) {
+        for (int peerPort : nodeParam.getPeerPorts()) {
+            ClientNode.sendMessage("127.0.0.1", peerPort, json);
+        }
+    }
+
+    // ── FIX (Issue 2): Filter out self from peer weight address map ───────────
+    private String buildPeersJson(Map<Integer, String> allAddrs) {
+        StringBuilder sb = new StringBuilder("{");
+        boolean first = true;
+        for (Map.Entry<Integer, String> entry : allAddrs.entrySet()) {
+            if (entry.getKey() == nodeParam.getNodeId()) continue; // skip self
+            if (!first) sb.append(",");
+            sb.append(String.format("\"%d\":\"%s\"", entry.getKey(), entry.getValue()));
+            first = false;
+        }
+        sb.append("}");
+        return sb.toString();
+    }
+
+    private void pollUntilStatus(String targetStatus, long timeoutMs) throws InterruptedException {
+        long start = System.currentTimeMillis();
+        while (System.currentTimeMillis() - start < timeoutMs) {
+            try {
+                String resp = httpGet(pythonBase + "/status");
+                if (resp.contains("\"phase\":\"" + targetStatus + "\"")
+                        || resp.contains("\"phase\": \"" + targetStatus + "\"")) {
+                    return;
                 }
-
-                // 2) Update NodeParam from Python result
-                params.setWeights(trainResult.weights, trainResult.bias);
-                System.out.println("Received params from Python after round " + trainResult.round);
-
-                // 3) Connection test only: send back same params directly
-                sendParamsToPython(out,MSG_AGGREGATED_PARAMS, round, params.getWeights(), params.getBias());
-                out.flush();
-                System.out.println("Sent params back to Python for round " + (round+1));
-
-            }   
-            sendParamsToPython(out, MSG_SHUTDOWN, totalRounds, params.getWeights(), params.getBias());
-            out.flush();
-
-        } catch (SocketTimeoutException e){
-            System.err.println("Python socket timeout: " + e.getMessage());
-        } catch (Exception e){
-            System.err.println("RoundController Error: " + e.getMessage());
-            e.printStackTrace();
+            } catch (Exception ignored) {
+                // Python may be mid-startup; keep polling
+            }
+            Thread.sleep(2000);
         }
-
-        System.out.println("[Node " + params.getNodeId() + "] All rounds complete.");
-
-        // for (int round = 0; round < totalRounds; round++) {
-        //     System.out.println("\nNode " + params.getNodeId() + ": Round " + round + "...");
-        //     params.setCurrentRound(round);
-
-        //     // Step 1: local training happens here (Python bridge later)
-        //     // 
-        //     System.out.println("Python Script running, training locally...");
-        //     Thread.sleep(1000);
-        //     // param.setWeights(x[], x)
-        //     System.out.println("Trainning complete, nothing changed");
-
-        //     // Step 2: request weights from all peers
-        //     List<String> responses = new ArrayList<>();
-        //     for (int peerPort : peerPorts) {
-        //         String response = client.requestWeights(peerHost, peerPort, round);
-        //         if (response != null) {
-        //             System.out.println("Node " + params.getNodeId() + ", Got from port " + peerPort + ": " + response);
-        //             responses.add(response);
-        //         }
-        //     }
-
-        //     // Step 3: check threshold
-        //     if (responses.size() >= minPeers) {
-        //         System.out.println("Enough peers data, doing aggregation algorithm");
-        //         // TODO: parse JSON like responses and call caculate new weights here
-        //     } else {
-        //         System.out.println("No peers responded — using own weights only");
-        //     }
-
-        //     // Step 4: small pause between rounds
-            
-        //     Thread.sleep(1000);
-           
-        // }
-        // System.out.println("[Node " + params.getNodeId() + "] All rounds complete.");
+        throw new RuntimeException("Timeout waiting for Python status: " + targetStatus);
     }
 
-    private void sendParamsToPython(DataOutputStream out, byte msgType, int round, double[] weights, double bias) throws Exception{
-        ByteBuffer payload = ByteBuffer.allocate(4 + (weights.length * 4) + 4).order(ByteOrder.LITTLE_ENDIAN);
+    // ── FIX (Bug 1): Pre-add self so no self-send is needed ──────────────────
+    private void waitForAllPeers(String msgType, int currentRound) throws InterruptedException {
+        Set<Integer> finishedNodes = new HashSet<>();
+        finishedNodes.add(nodeParam.getNodeId()); // self is already done
+        int required = nodeParam.getPeerPorts().size() + 1; // total nodes in cluster
 
-        payload.putInt(weights.length);
-        for (double w : weights){
-            payload.putFloat((float) w);
-        }
-
-        payload.putFloat((float) bias);
-
-        byte[] p = payload.array();
-        out.write(MAGIC);
-        out.writeByte(VERSION);
-        out.writeByte(msgType);
-        out.writeInt(round);
-        out.writeInt(p.length);
-        out.write(p);
-        out.flush();
-    }
-
-    private Frame readFrame(DataInputStream in) throws Exception{
-        byte[] magic = new byte[4];
-        in.readFully(magic);
-        for (int i = 0; i < 4; i++){
-            if (magic[i] != MAGIC[i]){
-                throw new IllegalStateException("Bad magic header");
+        while (finishedNodes.size() < required) {
+            String msg = MessageStore.takeMessage();
+            if (msg.contains("\"type\":\"" + msgType + "\"")
+                    && msg.contains("\"round\":" + currentRound)) {
+                int idx    = msg.indexOf("\"node\":");
+                int endIdx = msg.indexOf(",", idx);
+                if (endIdx == -1) endIdx = msg.indexOf("}", idx);
+                try {
+                    int nId = Integer.parseInt(msg.substring(idx + 7, endIdx).trim());
+                    finishedNodes.add(nId);
+                    System.out.println("[Java] Received " + msgType + " from Node " + nId);
+                } catch (NumberFormatException e) {
+                    System.err.println("[Java] Could not parse node id from: " + msg);
+                }
+            } else {
+                // Not the message we need — put it back for other consumers
+                MessageStore.addMessage(msg);
+                Thread.sleep(100);
             }
         }
-
-        byte version = in.readByte();
-        if (version != VERSION){
-            throw new IllegalStateException("Unsupported version: " + version);
-        }
-
-        byte type = in.readByte();
-        int round = in.readInt();
-        int payloadLen = in.readInt();
-        if (payloadLen <= 0 || payloadLen > 32 * 1024 * 1024){
-            throw new IllegalStateException("Invalid payload length: " + payloadLen);
-        }
-
-        byte[] payload = new byte[payloadLen];
-        in.readFully(payload);
-
-        ByteBuffer bb = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN);
-        int n = bb.getInt();
-        if (n <= 0 || n > 1_000_000_000){
-            throw new IllegalStateException("Invalid weight count: " + n);
-        }
-        double[] weights = new double[n];
-        for (int i = 0; i < n; i++){
-            weights[i] = bb.getFloat();
-        }
-
-        double bias = bb.getFloat();
-
-        return new Frame(type, round, weights, bias);
     }
 
-    private static class Frame{
-        final byte type;
-        final int round;
-        final double[] weights;
-        final double bias;
+    // ── HTTP helpers ──────────────────────────────────────────────────────────
+    private static String httpPost(String url, String jsonBody) throws IOException {
+        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+        conn.setRequestMethod("POST");
+        conn.setRequestProperty("Content-Type", "application/json");
+        conn.setDoOutput(true);
+        conn.setConnectTimeout(5_000);
+        conn.setReadTimeout(300_000);
+        try (OutputStream os = conn.getOutputStream()) {
+            os.write(jsonBody.getBytes(StandardCharsets.UTF_8));
+        }
+        return readResponse(conn);
+    }
 
-        Frame(byte type, int round, double[] weights, double bias){
-            this.type = type;
-            this.round = round;
-            this.weights = weights;
-            this.bias = bias;
+    private static String httpGet(String url) throws IOException {
+        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+        conn.setRequestMethod("GET");
+        conn.setConnectTimeout(5_000);
+        conn.setReadTimeout(5_000);
+        return readResponse(conn);
+    }
+
+    private static String readResponse(HttpURLConnection conn) throws IOException {
+        try (BufferedReader br = new BufferedReader(
+                new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = br.readLine()) != null) sb.append(line);
+            return sb.toString();
         }
     }
 }

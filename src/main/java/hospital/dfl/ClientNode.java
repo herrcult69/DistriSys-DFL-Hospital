@@ -1,32 +1,21 @@
 package hospital.dfl;
-import java.net.*;
-import java.io.*;
+
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 
 public class ClientNode {
-    private final int nodeId;
 
-    public ClientNode(int nodeId) {
-        this.nodeId = nodeId;
-    }
-    
-    public String requestWeights(String peerAddr, int peerPort, int round) {
-        try (Socket socket = new Socket(peerAddr, peerPort)) {
-            socket.setSoTimeout(3000);
-            PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
-            BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-
-            // send dummy request to peers
-            out.println("{\"type\":\"getparam\"" + 
-                        ",\"from\":" + this.nodeId + 
-                        ",\"round\":" + round + "}");
-
-            return in.readLine().trim();
-        } catch (SocketTimeoutException e) {
-            System.err.println("Peer:" + peerPort + " Timed out");
-            return null;
+    public static void sendMessage(String ip, int port, String json) {
+        try (Socket socket = new Socket(ip, port)) {
+            byte[] data = json.getBytes(StandardCharsets.UTF_8);
+            DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+            out.writeInt(data.length);
+            out.write(data);
+            out.flush();
         } catch (IOException e) {
-            System.err.println("Peer:" + peerPort + " Unreachable");
-            return null;
+            System.err.println("Failed to send message to " + ip + ":" + port + " - " + e.getMessage());
         }
     }
 }
